@@ -12,6 +12,13 @@ package kvserver_test
 
 import (
 	"context"
+	"fmt"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"math/rand"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -185,6 +192,10 @@ func TestMergeOfRangeEventTableWhileRunningRangefeed(t *testing.T) {
 	require.Regexp(t, context.Canceled.Error(), <-rangefeedErrChan)
 }
 
+func scratchKey(key string) roachpb.Key {
+	return testutils.MakeKey(keys.TableDataMax, []byte(key))
+}
+
 func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -241,4 +252,260 @@ func TestRangefeedIsRoutedToNonVoter(t *testing.T) {
 	rangefeedCancel()
 	require.Regexp(t, "context canceled", <-rangefeedErrChan)
 	require.Regexp(t, "attempting to create a RangeFeed over replica.*2NON_VOTER", getRec().String())
+}
+
+func TestRangefeedStuck(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	rng := rand.New(rand.NewSource(823748192734))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tc := testcluster.StartTestCluster(t, 5, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+
+	db := tc.Server(0).DB()
+	ds := tc.Server(0).DistSenderI().(*kvcoord.DistSender)
+	_, err := tc.ServerConn(0).Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true")
+	require.NoError(t, err)
+
+	tc.ScratchRange(t)
+
+	// Start rangefeed goroutine.
+	errCh := make(chan error, 2)
+	eventCh := make(chan *roachpb.RangeFeedEvent, 1000)
+	go func() {
+		errCh <- ds.RangeFeed(
+			ctx,
+			roachpb.Span{Key: scratchKey("a"), EndKey: scratchKey("z")},
+			db.Clock().Now(),
+			false, /* withDiff */
+			eventCh,
+		)
+	}()
+
+	var receivedValues int32 = 0
+	var sentValues int32 = 0
+
+	// Start consumer goroutine, which filters checkpoint events and passes
+	// resolved timestamps through resolvedCh.
+	resolvedCh := make(chan hlc.Timestamp, 100)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event := <-eventCh:
+				switch {
+				case event.Checkpoint != nil:
+					resolvedCh <- event.Checkpoint.ResolvedTS
+				case event.Error != nil:
+					errCh <- event.Error.Error.GoError()
+				case event.Val != nil:
+					currentReceived := atomic.AddInt32(&receivedValues, 1)
+					if currentReceived%5000 == 0 {
+						currentSent := atomic.LoadInt32(&sentValues)
+						t.Logf("received values %d, send values %d, current value: %v", currentReceived, currentSent, event.Val)
+					}
+				}
+			}
+		}
+	}()
+
+	randRange := func() []byte {
+		first := byte(randutil.RandIntInRange(rng, 'a', 'z'))
+		return testutils.MakeKey(keys.TableDataMax, []byte{first})
+	}
+
+	randKey := func() []byte {
+		return testutils.MakeKey(randRange(), randutil.RandBytes(rng, 5))
+	}
+
+	// Start writer go routine that would feed data into change feed
+	go func() {
+		throttle := time.NewTicker(time.Millisecond * 10)
+		defer throttle.Stop()
+		var lastSent int32 = 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-throttle.C:
+				// send data
+				if err := db.Put(ctx, randKey(), lastSent); err != nil {
+					t.Logf("Failed to write value %v", err)
+					continue
+				}
+				lastSent = atomic.AddInt32(&sentValues, 1)
+			}
+		}
+	}()
+
+	doSplit := func(rangeKey roachpb.Key) {
+		if err := db.AdminSplit(ctx, rangeKey, hlc.Timestamp{}); err != nil {
+			t.Logf("Failed to split range at %v", err)
+		}
+		t.Logf("Split on %v", rangeKey)
+	}
+
+	doTransfer := func(rangeKey roachpb.Key) bool {
+		// transfer lease and remove original leaseholder
+		rd, err := tc.LookupRange(rangeKey)
+		if err != nil {
+			t.Logf("Failed to lookup range %v for replica changes: %v", rangeKey, err)
+			return false
+		}
+		lease, _, err := tc.FindRangeLeaseEx(ctx, rd, nil)
+		if err != nil {
+			t.Logf("Failed to find lease on range %v for replica changes: %v", rangeKey, err)
+			return false
+		}
+		replicaSubset := rd.Replicas().FilterToDescriptors(func(rDesc roachpb.ReplicaDescriptor) bool {
+			return rDesc.NodeID != lease.Current().Replica.NodeID
+		})
+		if len(replicaSubset) == 0 {
+			t.Logf("Range %v has only single replica.", rangeKey)
+			return false
+		}
+		newLeasholderDescriptor := replicaSubset[rng.Intn(len(replicaSubset))]
+		err = tc.TransferRangeLease(rd,
+			roachpb.ReplicationTarget{NodeID: newLeasholderDescriptor.NodeID, StoreID: newLeasholderDescriptor.StoreID})
+		if err != nil {
+			t.Logf("Failed to transfer lease for %v: %v", rangeKey, err)
+			return false
+		}
+		r := lease.Current().Replica
+		_, err = tc.RemoveVoters(rangeKey, roachpb.ReplicationTarget{NodeID: r.NodeID, StoreID: r.StoreID})
+		if err != nil {
+			t.Logf("Failed to remove ex leaseholder replica on n%v from range %v: %v", r.NodeID, rd, err)
+			return false
+		}
+		t.Logf("Transferred lease on %v from n%v to n%v", rd, r.NodeID, newLeasholderDescriptor.NodeID)
+		return true
+	}
+
+	doMagic := func() {
+		// Pick a range by key
+		initial := randKey()
+		// create several splits
+		rd, err := tc.LookupRange(initial)
+		if err != nil {
+			t.Logf("Failed to get range descriptor for %v", initial)
+			return
+		}
+		var rangeToMove roachpb.Key
+		for i := 0; i < 3; i++ {
+			middle := midKey(roachpb.Key(rd.StartKey), roachpb.Key(rd.EndKey))
+			_, rd, err = tc.SplitRange(middle)
+			if err != nil {
+				t.Logf("Failed to get range descriptor for %v on iteration %d at %v", rd, i, middle)
+				return
+			}
+			if i == 1 {
+				rangeToMove = roachpb.Key(rd.StartKey)
+			}
+			t.Logf("Split range %v at %v", rd, middle)
+		}
+		// move leaseholder for intermediate node? is it even possible at this point
+		if doTransfer(rangeToMove) {
+			t.Logf("Magic complete")
+		}
+	}
+
+	// Start split-merge-move routine.
+	go func() {
+		throttle := time.NewTicker(time.Millisecond * 500)
+		defer throttle.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Millisecond * time.Duration(randutil.RandIntInRange(rng, 10, 1000))):
+				rangeKey := randKey()
+				switch rng.Intn(3) {
+				case 0:
+					doSplit(rangeKey)
+				case 1:
+					doMagic()
+
+					//doSplit(rangeKey)
+					//doTransfer(rangeKey)
+					//t.Logf("Split + transfer complete")
+					// this is potentially useless because ranges are not co-located
+					//t.Logf("Trying to merge on %v", rangeKey)
+					//if err := db.AdminMerge(ctx, rangeKey); err != nil {
+					//  t.Logf("Failed to merge range %v", err)
+					//}
+				case 2:
+					doTransfer(rangeKey)
+				}
+			}
+		}
+	}()
+
+	// Start timestamp monitoring
+	testLimit := time.After(10 * time.Minute)
+	var ts hlc.Timestamp
+	for {
+		select {
+		case ts = <-resolvedCh:
+			//t.Logf("Frontier is behind by %d", hlc.UnixNano() - ts.WallTime)
+		case err := <-errCh:
+			require.Fail(t, "rangefeed failed", "err: %v", err)
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+			t.Logf("timed out waiting for resolved timestamp, last: %v", ts)
+			fmt.Printf("%s\n", stacks())
+			return
+		case <-testLimit:
+			return
+		}
+	}
+
+}
+
+// stacks is a wrapper for runtime.Stack that attempts to recover the data for all goroutines.
+func stacks() []byte {
+	// We don't know how big the traces are, so grow a few times if they don't fit. Start large, though.
+	var trace []byte
+	for n := 1 << 20; /* 1mb */ n <= (1 << 29); /* 512mb */ n *= 2 {
+		trace = make([]byte, n)
+		nbytes := runtime.Stack(trace, true /* all */)
+		if nbytes < len(trace) {
+			return trace[:nbytes]
+		}
+	}
+	return trace
+}
+
+func midKey(start, end roachpb.Key) roachpb.Key {
+	longestKey := len(start)
+	if longestKey < len(end) {
+		longestKey = len(end)
+	}
+	newkey := make([]byte, longestKey)
+	overflow := 0
+	for i := 0; i < longestKey; i++ {
+		left := 0
+		right := 0
+		if i < len(start) {
+			left = int(start[i])
+		}
+		if i < len(end) {
+			right = int(end[i])
+		}
+		mid := (left + right) / 2  + overflow
+		odd := (left + right) % 2
+		newkey[i] = byte(mid)
+		if odd != 0 {
+			overflow = 127
+		} else {
+			overflow = 0
+		}
+	}
+	if overflow != 0 {
+		newkey = append(newkey, byte(overflow))
+	}
+	return newkey
 }
