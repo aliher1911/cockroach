@@ -37,9 +37,9 @@ var jepsenNemeses = []struct {
 	{"strobe-skews", "--nemesis strobe-skews"},
 	// TODO(bdarnell): subcritical-skews nemesis is currently flaky due to ntp rate limiting.
 	// https://github.com/cockroachdb/cockroach/issues/35599
-	//{"subcritical-skews", "--nemesis subcritical-skews"},
-	//{"majority-ring-subcritical-skews", "--nemesis majority-ring --nemesis2 subcritical-skews"},
-	//{"subcritical-skews-start-kill-2", "--nemesis subcritical-skews --nemesis2 start-kill-2"},
+	{"subcritical-skews", "--nemesis subcritical-skews"},
+	{"majority-ring-subcritical-skews", "--nemesis majority-ring --nemesis2 subcritical-skews"},
+	{"subcritical-skews-start-kill-2", "--nemesis subcritical-skews --nemesis2 start-kill-2"},
 	{"majority-ring-start-kill-2", "--nemesis majority-ring --nemesis2 start-kill-2"},
 	{"parts-start-kill-2", "--nemesis parts --nemesis2 start-kill-2"},
 }
@@ -64,7 +64,7 @@ func initJepsen(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// so do it before the initialization check for ease of iteration.
 	if err := c.GitClone(
 		ctx, t.L(),
-		"https://github.com/cockroachdb/jepsen", "/mnt/data1/jepsen", "tc-nightly", controller,
+		"https://github.com/aliher1911/jepsen", "/mnt/data1/jepsen", "tc-nightly-jepsen-0.1.19", controller,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func initJepsen(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// Install Jepsen's prereqs on the controller.
 	if result, err := c.RunWithDetailsSingleNode(
 		ctx, t.L(), controller, "sh", "-c",
-		`"sudo DEBIAN_FRONTEND=noninteractive apt-get -qqy install openjdk-8-jre openjdk-8-jre-headless libjna-java gnuplot > /dev/null 2>&1"`,
+		`"sudo DEBIAN_FRONTEND=noninteractive apt-get -qqy install openjdk-8-jre openjdk-8-jre-headless libjna-java gnuplot graphviz > /dev/null 2>&1"`,
 	); err != nil {
 		if result.RemoteExitStatus == "100" {
 			t.Skip("apt-get failure (#31944)", result.Stdout+result.Stderr)
@@ -233,6 +233,7 @@ cd /mnt/data1/jepsen/cockroachdb && set -eo pipefail && \
 	case testErr = <-errCh:
 		if testErr == nil {
 			t.L().Printf("passed, grabbing minimal logs")
+			testErr = fmt.Errorf("great success") // TODO(oleg): don't forget to remove (!!!)
 		} else {
 			t.L().Printf("failed: %s", testErr)
 		}
@@ -266,10 +267,10 @@ cd /mnt/data1/jepsen/cockroachdb && set -eo pipefail && \
 		ignoreErr := false
 		if err := runE(c, ctx, controller,
 			`grep -E "(Oh jeez, I'm sorry, Jepsen broke. Here's why|Caused by)" /mnt/data1/jepsen/cockroachdb/invoke.log -A1 | grep `+
-				`-e BrokenBarrierException `+
-				`-e InterruptedException `+
-				`-e ArrayIndexOutOfBoundsException `+
-				`-e NullPointerException `+
+				//`-e BrokenBarrierException `+
+				//`-e InterruptedException `+
+				//`-e ArrayIndexOutOfBoundsException `+
+				//`-e NullPointerException `+
 				// And one more ssh failure we've seen, apparently encountered when
 				// downloading logs.
 				`-e "clojure.lang.ExceptionInfo: clj-ssh scp failure" `+
