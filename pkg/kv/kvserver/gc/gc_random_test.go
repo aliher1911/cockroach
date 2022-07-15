@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -38,6 +39,7 @@ type randomRunGCTestSpec struct {
 	now          hlc.Timestamp
 	ttlSec       int32
 	intentAgeSec int32
+	wc           wigglerConfig
 }
 
 var (
@@ -223,6 +225,13 @@ func TestNewVsInvariants(t *testing.T) {
 	ctx := context.Background()
 	const N = 100000
 
+	wc := wigglerConfig{
+		pointMove:  0.05,
+		strayPoint: 0.05,
+		moveRange:  0.1,
+		splitRange: 0.1,
+	}
+
 	for _, tc := range []randomRunGCTestSpec{
 		{
 			ds: someVersionsMidSizeRowsLotsOfIntents,
@@ -257,8 +266,27 @@ func TestNewVsInvariants(t *testing.T) {
 			// not removed.
 			ttlSec: 50,
 		},
+		{
+			ds: someVersionsWithSomeRangeKeys,
+			now: hlc.Timestamp{
+				WallTime: 100 * time.Second.Nanoseconds(),
+			},
+			ttlSec:       10,
+			intentAgeSec: 15,
+			wc:           wc,
+		},
+		{
+			ds: someVersionsWithSomeRangeKeys,
+			now: hlc.Timestamp{
+				WallTime: 100 * time.Second.Nanoseconds(),
+			},
+			// Higher TTL means range tombstones between 70 sec and 50 sec are
+			// not removed.
+			ttlSec: 50,
+			wc:     wc,
+		},
 	} {
-		t.Run(fmt.Sprintf("%v@%v,ttl=%vsec", tc.ds, tc.now, tc.ttlSec), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%v@%v,ttl=%vsec,wiggle=%t", tc.ds, tc.now, tc.ttlSec, tc.wc.enabled()), func(t *testing.T) {
 			rng, seed := randutil.NewTestRand()
 			t.Logf("Using subtest seed: %d", seed)
 
@@ -266,7 +294,10 @@ func TestNewVsInvariants(t *testing.T) {
 			eng := storage.NewDefaultInMemForTesting()
 			defer eng.Close()
 
-			sortedDistribution(tc.ds.dist(N, rng)).setupTest(t, eng, *desc)
+			w := newRequestWiggler(tc.wc, rng)
+
+			stats := sortedDistribution(w.peekDistribution(tc.ds.dist(N, rng))).setupTest(t, eng,
+				*desc)
 			beforeGC := eng.NewSnapshot()
 
 			// Run GCer over snapshot.
@@ -282,30 +313,252 @@ func TestNewVsInvariants(t *testing.T) {
 				gcer.resolveIntentsAsync)
 			require.NoError(t, err)
 
-			// Handle GC + resolve intents.
-			var stats enginepb.MVCCStats
-			require.NoError(t,
-				storage.MVCCGarbageCollect(ctx, eng, &stats, gcer.pointKeys(), gcThreshold))
+			gcRequests := gcer.pointKeys()
+			if tc.wc.enabled() {
+				gcRequests = w.wigglePoints(gcRequests)
+			}
+
+			// Handle GC + Resolve intents.
 			for _, i := range gcer.intents {
 				l := roachpb.LockUpdate{
 					Span:   roachpb.Span{Key: i.Key},
 					Txn:    i.Txn,
 					Status: roachpb.ABORTED,
 				}
-				_, err := storage.MVCCResolveWriteIntent(ctx, eng, &stats, l)
+				ok, err := storage.MVCCResolveWriteIntent(ctx, eng, &stats, l)
 				require.NoError(t, err, "failed to resolve intent")
+				require.True(t, ok, "intent resolved")
 			}
-			for _, batch := range gcer.rangeKeyBatches() {
-				rangeKeys := makeCollectableGCRangesFromGCRequests(desc.StartKey.AsRawKey(),
-					desc.EndKey.AsRawKey(), batch)
-				require.NoError(t,
-					storage.MVCCGarbageCollectRangeKeys(ctx, eng, &stats, rangeKeys))
+			require.NoError(t,
+				storage.MVCCGarbageCollect(ctx, eng, &stats, gcRequests, gcThreshold))
+			for _, batch1 := range gcer.rangeKeyBatches() {
+				rebatch := [][]roachpb.GCRequest_GCRangeKey{batch1}
+				if tc.wc.enabled() {
+					rebatch = w.wiggleRanges(batch1)
+				}
+				for _, batch := range rebatch {
+					rangeKeys := makeCollectableGCRangesFromGCRequests(desc.StartKey.AsRawKey(),
+						desc.EndKey.AsRawKey(), batch)
+					require.NoError(t,
+						storage.MVCCGarbageCollectRangeKeys(ctx, eng, &stats, rangeKeys))
+				}
 			}
 
 			assertLiveData(t, eng, beforeGC, *desc, tc.now, gcThreshold, intentThreshold, ttl,
 				gcInfoNew)
+
+			assertOperationStats(t, eng, desc, stats, tc.now)
 		})
 	}
+}
+
+func assertOperationStats(t *testing.T, eng storage.Engine, desc *roachpb.RangeDescriptor,
+	stats enginepb.MVCCStats, statsAge hlc.Timestamp,
+) {
+	statsIt := eng.NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+		KeyTypes:   storage.IterKeyTypePointsAndRanges,
+		LowerBound: desc.StartKey.AsRawKey(),
+		UpperBound: desc.EndKey.AsRawKey(),
+	})
+	finalStats, err := storage.ComputeStatsForRange(statsIt, desc.StartKey.AsRawKey(),
+		desc.EndKey.AsRawKey(), statsAge.WallTime)
+	stats.AgeTo(statsAge.WallTime)
+	require.NoError(t, err, "failed to collect stats after test")
+	require.EqualValues(t, finalStats, stats, "GC vs Computes stats.")
+}
+
+type wigglerConfig struct {
+	// Probability of moving point GC request to a higher timestamp.
+	pointMove float32
+	// Probability of creating a request for non-existent key.
+	strayPoint float32
+	// Probability of moving range GC request to a higher timestamp.
+	moveRange float32
+	// Probability of splitting range request into two.
+	splitRange float32
+}
+
+func (wc wigglerConfig) enabled() bool {
+	return wc.pointMove > 0 || wc.strayPoint > 0 || wc.moveRange > 0 || wc.splitRange > 0
+}
+
+func newRequestWiggler(config wigglerConfig, rng *rand.Rand,
+) requestWiggler {
+	return requestWiggler{
+		wigglerConfig: config,
+		rng:           rng,
+		pointKeys:     make(map[string][]storage.MVCCKey),
+		rangeKeys:     nil,
+	}
+}
+
+// requestWiggler can randomly adjust gc request keys and timestamps while
+// maintaining expected outcome the same.
+type requestWiggler struct {
+	wigglerConfig
+	rng *rand.Rand
+
+	// All keys with optional histories for keys that we want to move around.
+	pointKeys map[string][]storage.MVCCKey
+	// All range keys. Safe to store all original ranges as we only generate
+	// 100s of them.
+	rangeKeys []storage.MVCCRangeKeyValue
+}
+
+func (w *requestWiggler) peekDistribution(d dataDistribution) dataDistribution {
+	var (
+		prevPointKey roachpb.Key
+		movePoint    bool
+	)
+	return func() (storage.MVCCKeyValue, storage.MVCCRangeKeyValue, *roachpb.Transaction, bool) {
+		kv, rkv, txn, ok := d()
+		if !ok {
+			// Once all items are read, do preprocessing of data.
+			sort.Slice(w.rangeKeys, func(i, j int) bool {
+				// We know that timestamps of ranges are always different.
+				return w.rangeKeys[i].RangeKey.Timestamp.Less(w.rangeKeys[j].RangeKey.Timestamp)
+			})
+		} else {
+			if !rkv.RangeKey.Timestamp.IsEmpty() {
+				w.rangeKeys = append(w.rangeKeys, rkv)
+			} else {
+				if !kv.Key.Key.Equal(prevPointKey) {
+					prevPointKey = kv.Key.Key
+					movePoint = w.rng.Float32() < w.pointMove
+					w.pointKeys[prevPointKey.String()] = nil
+				}
+				if movePoint {
+					sk := prevPointKey.String()
+					w.pointKeys[sk] = append(w.pointKeys[sk], kv.Key)
+				}
+			}
+		}
+		return kv, rkv, txn, ok
+	}
+}
+
+// Wiggle points can move requests up as far as next key in history.
+// It could also add requests at non-existent keys with random timestamps.
+func (w *requestWiggler) wigglePoints(rs []roachpb.GCRequest_GCKey) (res []roachpb.GCRequest_GCKey) {
+	for _, r := range rs {
+		if vs, ok := w.pointKeys[r.Key.String()]; ok && vs != nil {
+			versions := len(vs)
+			vIdx := sort.Search(versions, func(i int) bool {
+				return r.Timestamp.Less(vs[i].Timestamp)
+			})
+			if vIdx < versions {
+				// For intermediate versions, set timestamp down 1 from version above.
+				r.Timestamp = vs[vIdx].Timestamp.Add(-1, 0)
+			} else {
+				// For top level object, just increase timestamp by 1.
+				r.Timestamp = r.Timestamp.Add(1, 0)
+			}
+		}
+		res = append(res, r)
+		if w.rng.Float32() < w.strayPoint {
+			// Try to add a new key after current one if it is not already taken
+			// and reuse timestamp.
+			newKey := r.Key.Clone().Next()
+			if _, ok := w.pointKeys[newKey.String()]; !ok {
+				r.Key = newKey
+				res = append(res, r)
+			}
+		}
+	}
+	return rs
+}
+
+// We can split ranges or move them up till next range and reorder.
+// If we split ranges, may need to generate new batches to intentionally send
+// parts out of order to have left side gaps introduced.
+func (w *requestWiggler) wiggleRanges(batch []roachpb.GCRequest_GCRangeKey) [][]roachpb.GCRequest_GCRangeKey {
+	var result [][]roachpb.GCRequest_GCRangeKey
+	var newBatch []roachpb.GCRequest_GCRangeKey
+	for _, r := range batch {
+		if w.rng.Float32() < w.moveRange {
+			// Just bump it by 1 logical since we have all keys spaced at least 1 ns
+			// apart.
+			r.Timestamp = r.Timestamp.Add(0, 1)
+		}
+		if w.rng.Float32() < w.splitRange {
+			savedStart := r.StartKey.Clone()
+			// Update range to have start key shifted right.
+			r.StartKey = r.StartKey.Next()
+			newBatch = append(newBatch, r)
+			// Push new batch out to clean out of order.
+			result = append(result, newBatch)
+			newBatch = nil
+			r.StartKey = savedStart.Clone()
+			r.EndKey = savedStart.Next()
+		}
+		newBatch = append(newBatch, r)
+	}
+	if len(newBatch) > 0 {
+		result = append(result, newBatch)
+	}
+	return result
+}
+
+func TestSplit(t *testing.T) {
+
+	mkKey := func(key string) roachpb.Key {
+		var k roachpb.Key
+		k = append(k, keys.SystemSQLCodec.TablePrefix(42)...)
+		k = append(k, key...)
+		return k
+	}
+
+	for _, d := range []struct {
+		start, end roachpb.Key
+	}{
+		{mkKey("a"), mkKey("z")},
+		{mkKey("a"), mkKey("aa")},
+		{mkKey("abc"), mkKey("ac")},
+		{mkKey("a\000"), mkKey("a\001")},
+		{mkKey("a\000"), mkKey("ab")},
+	} {
+		t.Run("test", func(t *testing.T) {
+			res := splitRange(d.start, d.end)
+			fmt.Printf("Split %s, %s to %s\n", d.start.String(), d.end.String(), res.String())
+		})
+	}
+}
+
+func splitRange(start, end roachpb.Key) roachpb.Key {
+	short := len(start)
+	res := end.Clone()
+	if lenEnd := len(end); lenEnd < short {
+		res = start.Clone()
+		short = lenEnd
+	}
+	i := 0
+	for ; i < short; i++ {
+		if start[i] == end[i] {
+			res[i] = start[i]
+		} else {
+			break
+		}
+	}
+	left := byte(0)
+	if i < len(start) {
+		left = start[i]
+	}
+	right := byte(255)
+	if i < len(end) {
+		right = end[i]
+	}
+	if right < left {
+		panic(fmt.Sprintf("keys %s and %s can't be split", start.String(), end.String()))
+	}
+	mid := byte((int(left)+int(right))/2) + left
+	if mid != left {
+		res[i] = mid
+	} else {
+		res[i] = left
+		i++
+		res[i] = 127
+	}
+	return res[:i]
 }
 
 type historyItem struct {
