@@ -4891,6 +4891,71 @@ func MVCCGarbageCollectRangeKeys(
 	return nil
 }
 
+// MVCCGarbageCollectWholeRange removes all the range data and resets counters.
+// It only does so if data is completely covered by range keys
+func MVCCGarbageCollectWholeRange(
+	ctx context.Context,
+	rw ReadWriter,
+	ms *enginepb.MVCCStats,
+	start, end roachpb.Key,
+	gcThreshold hlc.Timestamp,
+) error {
+	if ms.ContainsEstimates == 0 && ms.LiveCount > 0 {
+		return errors.Errorf("range contains live data, can't use GC clear range")
+	}
+	if err := CheckRangeEmptiness(ctx, rw, start, end, gcThreshold); err != nil {
+		return err
+	}
+	if err := rw.ClearRawRange(start, end, true, true); err != nil {
+		return err
+	}
+	if ms != nil {
+		// Reset point and range counters as we deleted the whole range.
+		ms.LiveCount = 0
+		ms.LiveBytes = 0
+		ms.KeyCount = 0
+		ms.ValCount = 0
+		ms.RangeKeyCount = 0
+		ms.RangeKeyBytes = 0
+		ms.RangeValCount = 0
+		ms.RangeValBytes = 0
+	}
+	return nil
+}
+
+func CheckRangeEmptiness(ctx context.Context,
+	rw Reader, start, end roachpb.Key, gcThreshold hlc.Timestamp,
+) error {
+	iter := NewMVCCIncrementalIterator(rw, MVCCIncrementalIterOptions{
+		KeyTypes:             IterKeyTypePointsAndRanges,
+		StartKey:             start,
+		EndKey:               end,
+		RangeKeyMaskingBelow: gcThreshold,
+		IntentPolicy:         MVCCIncrementalIterIntentPolicyError,
+	})
+	defer iter.Close()
+	iter.SeekGE(MVCCKey{Key: start})
+	for ; ; iter.Next() {
+		if ok, err := iter.Valid(); err != nil {
+			return err
+		} else if !ok {
+			break
+		}
+		hasPoint, hasRange := iter.HasPointAndRange()
+		if hasPoint {
+			return errors.Errorf("found key not covered by range tombstone %s", iter.UnsafeKey())
+		}
+		if hasRange {
+			newest := iter.RangeKeys().Newest()
+			if gcThreshold.Less(newest) {
+				return errors.Errorf("range tombstones above gc threshold. GC=%s, range=%s",
+					gcThreshold.String(), newest.String())
+			}
+		}
+	}
+	return nil
+}
+
 // MVCCFindSplitKey finds a key from the given span such that the left side of
 // the split is roughly targetSize bytes. The returned key will never be chosen
 // from the key ranges listed in keys.NoSplitSpans.
