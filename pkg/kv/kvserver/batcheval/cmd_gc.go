@@ -56,6 +56,12 @@ func declareKeysGC(
 		latchSpans.AddMVCC(spanset.SpanReadWrite, span,
 			header.Timestamp)
 	}
+
+	if rk := gcr.ClearRangeKey; rk != nil {
+		latchSpans.AddMVCC(spanset.SpanReadWrite, roachpb.Span{Key: rk.StartKey, EndKey: rk.EndKey},
+			header.Timestamp)
+	}
+
 	// Be smart here about blocking on the threshold keys. The MVCC GC queue can
 	// send an empty request first to bump the thresholds, and then another one
 	// that actually does work but can avoid declaring these keys below.
@@ -159,6 +165,18 @@ func GC(
 		desc.EndKey.AsRawKey(), args.RangeKeys)
 	if err := storage.MVCCGarbageCollectRangeKeys(ctx, readWriter, cArgs.Stats, rangeKeys); err != nil {
 		return result.Result{}, err
+	}
+
+	// Fast path operation to try to remove all user key data from the range.
+	if rk := args.ClearRangeKey; rk != nil {
+		if !rk.StartKey.Equal(desc.StartKey.AsRawKey()) || !rk.EndKey.Equal(desc.EndKey.AsRawKey()) {
+			return result.Result{}, errors.Errorf("gc with clear range operation could only be used on the full range")
+		}
+
+		if err := storage.MVCCGarbageCollectWholeRange(ctx, readWriter, cArgs.Stats,
+			rk.StartKey, rk.EndKey, cArgs.EvalCtx.GetGCThreshold()); err != nil {
+			return result.Result{}, err
+		}
 	}
 
 	// Optionally bump the GC threshold timestamp.
