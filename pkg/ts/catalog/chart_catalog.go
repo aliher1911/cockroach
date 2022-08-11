@@ -891,6 +891,12 @@ var charts = []sectionDescription{
 					"queue.gc.info.transactionspangcstaging",
 				},
 			},
+			{
+				Title: "GC Clear Range",
+				Metrics: []string{
+					"queue.gc.info.clearrange",
+				},
+			},
 		},
 	},
 	{

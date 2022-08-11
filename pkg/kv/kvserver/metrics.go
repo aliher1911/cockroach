@@ -1358,6 +1358,12 @@ The count is emitted by the leaseholder of each range.
 		Measurement: "Intent Resolutions",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaGCUsedClearRange = metric.Metadata{
+		Name:        "queue.gc.info.clearrange",
+		Help:        "Number of successful calls to perform ClearRange operation on full range",
+		Measurement: "Requests",
+		Unit:        metric.Unit_COUNT,
+	}
 
 	// Slow request metrics.
 	metaLatchRequests = metric.Metadata{
@@ -1817,6 +1823,7 @@ type StoreMetrics struct {
 	GCResolveFailed *metric.Counter
 	// Failures resolving intents that belong to local transactions.
 	GCTxnIntentsResolveFailed *metric.Counter
+	GCUsedClearRange          *metric.Counter
 
 	// Slow request counts.
 	SlowLatchRequests *metric.Gauge
@@ -2329,6 +2336,7 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		GCResolveSuccess:             metric.NewCounter(metaGCResolveSuccess),
 		GCResolveFailed:              metric.NewCounter(metaGCResolveFailed),
 		GCTxnIntentsResolveFailed:    metric.NewCounter(metaGCTxnIntentsResolveFailed),
+		GCUsedClearRange:             metric.NewCounter(metaGCUsedClearRange),
 
 		// Wedge request counters.
 		SlowLatchRequests: metric.NewGauge(metaLatchRequests),
