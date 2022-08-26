@@ -43,6 +43,31 @@ type dataDistribution func() (
 	storage.MVCCKeyValue, storage.MVCCRangeKeyValue, *roachpb.Transaction, bool,
 )
 
+type generationProgress struct {
+	keysWritten          int
+	keyBytesWritten      int
+	versionsWritten      int
+	bytesWritten         int
+	deletesWritten       int
+	intentsWritten       int
+	rangeKeysWritten     int
+	rangeKeyBytesWritten int
+}
+
+func (d generationProgress) String() string {
+	return fmt.Sprintf(
+		`keys=%d
+keyBytes=%d
+versions=%d
+bytes=%d
+deletes=%d
+intents=%d
+rangeKeys=%d
+rangeKeyBytes=%d
+`, d.keysWritten, d.keyBytesWritten, d.versionsWritten, d.bytesWritten, d.deletesWritten,
+		d.intentsWritten, d.rangeKeysWritten, d.rangeKeyBytesWritten)
+}
+
 // setupTest writes the data from this distribution into eng. All data should
 // be a part of the range represented by desc.
 func (ds dataDistribution) setupTest(
@@ -193,6 +218,28 @@ func sortedDistribution(dist dataDistribution) dataDistribution {
 	}
 }
 
+// addRangeTombstone prepends a range feed to distribution.
+// tombstone is not guaranteed to be valid if it is below other keys in
+// distribution.
+func addRangeTombstone(startKey, endKey roachpb.Key, ts hlc.Timestamp, dist dataDistribution,
+) dataDistribution {
+	var sent bool
+	return func() (storage.MVCCKeyValue, storage.MVCCRangeKeyValue, *roachpb.Transaction, bool) {
+		if !sent {
+			sent = true
+			return storage.MVCCKeyValue{}, storage.MVCCRangeKeyValue{
+				RangeKey: storage.MVCCRangeKey{
+					StartKey:  startKey,
+					EndKey:    endKey,
+					Timestamp: ts,
+				},
+			}, nil, true
+		} else {
+			return dist()
+		}
+	}
+}
+
 // maxRetriesAllowed is limiting how many times we could retry when generating
 // keys and timestamps for objects that are restricted by some criteria (e.g.
 // keys are unique, timestamps shouldn't be duplicate in history, intents
@@ -215,7 +262,7 @@ func newDataDistribution(
 	rangeKeyFrac float64,
 	totalKeys int,
 	rng *rand.Rand,
-) dataDistribution {
+) (dataDistribution, *generationProgress) {
 	rangeKeyDist := rangeKeyDistribution(keyDist)
 	var (
 		// Remaining values (all versions of all keys together with intents).
@@ -230,6 +277,8 @@ func newDataDistribution(
 		// If we should have an intent at the start of history.
 		hasIntent bool
 	)
+
+	var r generationProgress
 
 	generatePointKey := func() (nextKey, unusedEndKey roachpb.Key, keyTimestamps []hlc.Timestamp, hasIntent bool) {
 		hasIntent = rng.Float64() < intentFrac
@@ -295,6 +344,8 @@ func newDataDistribution(
 			}
 			retries = 0
 		}
+		r.keysWritten++
+		r.keyBytesWritten+=len(nextKey)
 		return nextKey, unusedEndKey, keyTimestamps, hasIntent
 	}
 
@@ -308,6 +359,8 @@ func newDataDistribution(
 		}
 		timestamps = []hlc.Timestamp{ts}
 		startKey, endKey = rangeKeyDist()
+		r.rangeKeysWritten++
+		r.rangeKeyBytesWritten += len(startKey) + len(endKey)
 		return startKey, endKey, timestamps, false
 	}
 
@@ -356,17 +409,24 @@ func newDataDistribution(
 			txn.ID = uuid.MakeV4()
 			txn.WriteTimestamp = ts
 			txn.Key = keyDist()
+			r.intentsWritten++
 		}
+		val := valueDist().RawBytes
+		if len(val) == 0 {
+			r.deletesWritten++
+		}
+		r.bytesWritten += len(val)
+		r.versionsWritten++
 		return storage.MVCCKeyValue{
 			Key:   storage.MVCCKey{Key: key, Timestamp: ts},
-			Value: valueDist().RawBytes,
+			Value: val,
 		}, storage.MVCCRangeKeyValue{}, txn, true
-	}
+	}, &r
 }
 
 // distSpec abstractly represents a distribution.
 type distSpec interface {
-	dist(maxRows int, rng *rand.Rand) dataDistribution
+	dist(maxRows int, rng *rand.Rand) (dataDistribution, *generationProgress)
 	desc() *roachpb.RangeDescriptor
 	String() string
 }
@@ -399,7 +459,9 @@ type uniformDistSpec struct {
 
 var _ distSpec = uniformDistSpec{}
 
-func (ds uniformDistSpec) dist(maxRows int, rng *rand.Rand) dataDistribution {
+func (ds uniformDistSpec) dist(maxRows int, rng *rand.Rand) (
+	dataDistribution, *generationProgress,
+) {
 	if ds.tsSecMinIntent <= ds.tsSecFrom && ds.rangeKeyFrac > 0 {
 		panic("min intent ts should be set if range key generation is needed")
 	}

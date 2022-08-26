@@ -38,6 +38,7 @@ type randomRunGCTestSpec struct {
 	now          hlc.Timestamp
 	ttlSec       int32
 	intentAgeSec int32
+	rangeBelow   bool
 }
 
 var (
@@ -124,7 +125,9 @@ func TestRunNewVsOld(t *testing.T) {
 			eng := storage.NewDefaultInMemForTesting()
 			defer eng.Close()
 
-			tc.ds.dist(N, rng).setupTest(t, eng, *tc.ds.desc())
+			dist, progress := tc.ds.dist(N, rng)
+			dist.setupTest(t, eng, *tc.ds.desc())
+			t.Log(progress.String())
 			snap := eng.NewSnapshot()
 
 			oldGCer := makeFakeGCer()
@@ -192,7 +195,12 @@ func BenchmarkRun(b *testing.B) {
 		return func(b *testing.B) {
 			eng := storage.NewDefaultInMemForTesting()
 			defer eng.Close()
-			ms := spec.ds.dist(b.N, rng).setupTest(b, eng, *spec.ds.desc())
+			dist, progress := spec.ds.dist(b.N, rng)
+			if spec.rangeBelow {
+				dist = addRangeTombstone(roachpb.Key{0}, roachpb.Key{0xff, 0xff, 0xff}, hlc.Timestamp{WallTime: 1}, dist)
+			}
+			ms := dist.setupTest(b, eng, *spec.ds.desc())
+			b.Log(progress.String()) // Mind that we don't log extra range here.
 			b.SetBytes(int64(float64(ms.Total()) / float64(b.N)))
 			b.ResetTimer()
 			_, err := runGC(eng, old, spec)
@@ -217,13 +225,14 @@ func BenchmarkRun(b *testing.B) {
 	specs := specsWithTTLs(fewVersionsTinyRows, ts100, ttls)
 	specs = append(specs, specsWithTTLs(someVersionsMidSizeRows, ts100, ttls)...)
 	specs = append(specs, specsWithTTLs(lotsOfVersionsMidSizeRows, ts100, ttls)...)
-	for _, old := range []bool{true, false} {
-		b.Run(fmt.Sprintf("old=%v", old), func(b *testing.B) {
+	for _, spec := range specs {
+		b.Run(fmt.Sprintf("%s/ttl=%d",spec.ds.String(), spec.ttlSec), func(b *testing.B) {
 			rng, seed := randutil.NewTestRand()
 			b.Logf("Using benchmark seed: %d", seed)
 
-			for _, spec := range specs {
-				b.Run(fmt.Sprint(spec.ds), makeTest(old, spec, rng))
+			for _, rangeBelow := range []bool{true, false} {
+				spec.rangeBelow = rangeBelow
+				b.Run(fmt.Sprintf("rangeBelow=%t", rangeBelow), makeTest(false, spec, rng))
 			}
 		})
 	}
@@ -276,7 +285,9 @@ func TestNewVsInvariants(t *testing.T) {
 			eng := storage.NewDefaultInMemForTesting()
 			defer eng.Close()
 
-			sortedDistribution(tc.ds.dist(N, rng)).setupTest(t, eng, *desc)
+			dist, progress := tc.ds.dist(N, rng)
+			sortedDistribution(dist).setupTest(t, eng, *desc)
+			t.Log(progress.String())
 			beforeGC := eng.NewSnapshot()
 
 			// Run GCer over snapshot.
