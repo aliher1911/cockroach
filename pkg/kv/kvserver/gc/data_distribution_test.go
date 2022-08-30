@@ -35,6 +35,26 @@ import (
 // timestamp than any other version written for the key.
 type dataDistribution func() (storage.MVCCKeyValue, *roachpb.Transaction, bool)
 
+type generationProgress struct {
+	keysWritten     int
+	keyBytesWritten int
+	versionsWritten int
+	bytesWritten    int
+	deletesWritten  int
+	intentsWritten  int
+}
+
+func (d generationProgress) String() string {
+	return fmt.Sprintf(
+		`keys=%d
+keyBytes=%d
+versions=%d
+bytes=%d
+deletes=%d
+intents=%d`, d.keysWritten, d.keyBytesWritten, d.versionsWritten, d.bytesWritten, d.deletesWritten,
+		d.intentsWritten)
+}
+
 // setupTest writes the data from this distribution into eng. All data should
 // be a part of the range represented by desc.
 func (ds dataDistribution) setupTest(
@@ -89,7 +109,7 @@ func newDataDistribution(
 	intentFrac float64,
 	totalKeys int,
 	rng *rand.Rand,
-) dataDistribution {
+) (dataDistribution, *generationProgress) {
 	// TODO(ajwerner): provide a mechanism to control the rate of expired intents
 	// or the intent age. Such a knob would likely require decoupling intents from
 	// other keys.
@@ -100,6 +120,7 @@ func newDataDistribution(
 		timestamps []hlc.Timestamp
 		haveIntent bool
 	)
+	var r generationProgress
 	return func() (storage.MVCCKeyValue, *roachpb.Transaction, bool) {
 		if remaining == 0 {
 			return storage.MVCCKeyValue{}, nil, false
@@ -130,11 +151,14 @@ func newDataDistribution(
 				break
 			}
 			haveIntent = rng.Float64() < intentFrac
+			r.keysWritten++
+			r.keyBytesWritten+=len(key)
 		}
 		ts := timestamps[0]
 		timestamps = timestamps[1:]
 		var txn *roachpb.Transaction
 		if len(timestamps) == 0 && haveIntent {
+			r.intentsWritten++
 			txn = &roachpb.Transaction{
 				Status:                 roachpb.PENDING,
 				ReadTimestamp:          ts,
@@ -144,16 +168,22 @@ func newDataDistribution(
 			txn.WriteTimestamp = ts
 			txn.Key = keyDist()
 		}
+		r.versionsWritten++
+		val := valueDist()
+		if len(val) == 0 {
+			r.deletesWritten++
+		}
+		r.bytesWritten += len(val)
 		return storage.MVCCKeyValue{
 			Key:   storage.MVCCKey{Key: key, Timestamp: ts},
 			Value: valueDist(),
 		}, txn, true
-	}
+	}, &r
 }
 
 // distSpec abstractly represents a distribution.
 type distSpec interface {
-	dist(maxRows int, rng *rand.Rand) dataDistribution
+	dist(maxRows int, rng *rand.Rand) (dataDistribution, *generationProgress)
 	desc() *roachpb.RangeDescriptor
 	String() string
 }
@@ -171,7 +201,7 @@ type uniformDistSpec struct {
 
 var _ distSpec = uniformDistSpec{}
 
-func (ds uniformDistSpec) dist(maxRows int, rng *rand.Rand) dataDistribution {
+func (ds uniformDistSpec) dist(maxRows int, rng *rand.Rand) (dataDistribution, *generationProgress) {
 	return newDataDistribution(
 		uniformTimestampDistribution(ds.tsFrom*time.Second.Nanoseconds(), ds.tsTo*time.Second.Nanoseconds(), rng),
 		uniformTableKeyDistribution(ds.desc().StartKey.AsRawKey(), ds.keySuffixMin, ds.keySuffixMax, rng),

@@ -94,7 +94,9 @@ func TestRunNewVsOld(t *testing.T) {
 			eng := storage.NewDefaultInMemForTesting()
 			defer eng.Close()
 
-			tc.ds.dist(N, rng).setupTest(t, eng, *tc.ds.desc())
+			ds, progress := tc.ds.dist(N, rng)
+			ds.setupTest(t, eng, *tc.ds.desc())
+			t.Log(progress.String())
 			snap := eng.NewSnapshot()
 
 			oldGCer := makeFakeGCer()
@@ -132,7 +134,6 @@ func TestRunNewVsOld(t *testing.T) {
 // BenchmarkRun benchmarks the old and implementations of Run with different
 // data distributions.
 func BenchmarkRun(b *testing.B) {
-	rng := rand.New(rand.NewSource(1))
 	ctx := context.Background()
 	runGC := func(eng storage.Engine, old bool, spec randomRunGCTestSpec) (Info, error) {
 		runGCFunc := Run
@@ -157,9 +158,12 @@ func BenchmarkRun(b *testing.B) {
 	}
 	makeTest := func(old bool, spec randomRunGCTestSpec) func(b *testing.B) {
 		return func(b *testing.B) {
+			rng := rand.New(rand.NewSource(1))
 			eng := storage.NewDefaultInMemForTesting()
 			defer eng.Close()
-			ms := spec.ds.dist(b.N, rng).setupTest(b, eng, *spec.ds.desc())
+			ds, progress := spec.ds.dist(b.N, rng)
+			ms := ds.setupTest(b, eng, *spec.ds.desc())
+			b.Log(progress.String())
 			b.SetBytes(int64(float64(ms.Total()) / float64(b.N)))
 			b.ResetTimer()
 			_, err := runGC(eng, old, spec)
@@ -187,7 +191,7 @@ func BenchmarkRun(b *testing.B) {
 	for _, old := range []bool{true, false} {
 		b.Run(fmt.Sprintf("old=%v", old), func(b *testing.B) {
 			for _, spec := range specs {
-				b.Run(fmt.Sprint(spec.ds), makeTest(old, spec))
+				b.Run(fmt.Sprintf("%s/ttl=%d",spec.ds, spec.ttl), makeTest(old, spec))
 			}
 		})
 	}
