@@ -164,6 +164,7 @@ func TestEndToEndGC(t *testing.T) {
 	execOrFatal(t, sqlDb, `SET CLUSTER SETTING kv.protectedts.poll_interval = '5s'`)
 
 	execOrFatal(t, sqlDb, `create table kv (k BIGINT NOT NULL PRIMARY KEY, v BYTES NOT NULL)`)
+	t.Logf("found table range after creation: %s", getTableRangeIDs(t, sqlDb))
 
 	for i := 0; i < 1000; i++ {
 		execOrFatal(t, sqlDb, "upsert into kv values ($1, $2)", rng.Int63(), "hello")
@@ -188,10 +189,13 @@ func TestEndToEndGC(t *testing.T) {
 			break
 		}
 	}
+	t.Logf("found table ranges after inserting data: %v", tableRangeIDs)
+	t.Logf("non-empty ranges: %v", nonEmptyRangeIDs)
 	require.NotEmpty(t, tableRangeIDs, "failed to query ranges belonging to table")
 	require.NotEmptyf(t, nonEmptyRangeIDs, "all table ranges are empty according to MVCCStats")
 
 	deleteRangeDataWithRangeTombstone(t, tableRangeIDs, kvDb, sqlDb)
+	t.Logf("found table ranges after range deletion: %s", getTableRangeIDs(t, sqlDb))
 
 	require.Empty(t, readSomeKeys(t, sqlDb), "table still contains data after range deletion")
 
