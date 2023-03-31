@@ -76,6 +76,7 @@ type kv struct {
 	writeSeq                             string
 	sequential                           bool
 	zipfian                              bool
+	sfuDelay                             time.Duration
 	splits                               int
 	secondaryIndex                       bool
 	shards                               int
@@ -150,6 +151,8 @@ var kvMeta = workload.Meta{
 				`uniformly over the key range.`)
 		g.flags.DurationVar(&g.timeout, `timeout`, 0, `Client-side statement timeout.`)
 		RandomSeed.AddFlag(&g.flags)
+		g.flags.DurationVar(&g.sfuDelay, `sfu-wait-delay`, 10*time.Millisecond,
+			`Delay before sfu write transaction commits or aborts`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -575,8 +578,7 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 			return err
 		}
 		// Simulate a transaction that does other work between the SFU and write.
-		// TODO(sumeer): this should be configurable.
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(o.config.sfuDelay)
 		if _, err = o.writeStmt.ExecTx(ctx, tx, writeArgs...); err != nil {
 			// Multiple write transactions can contend and encounter
 			// a serialization failure. We swallow such an error.
