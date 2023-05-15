@@ -34,9 +34,6 @@ const (
 	// defaultPushTxnsAge is the default age at which a Processor will begin to
 	// consider a transaction old enough to push.
 	defaultPushTxnsAge = 10 * time.Second
-	// defaultCheckStreamsInterval is the default interval at which a Processor
-	// will check all streams to make sure they have not been canceled.
-	defaultCheckStreamsInterval = 1 * time.Second
 )
 
 // newErrBufferCapacityExceeded creates an error that is returned to subscribers
@@ -72,10 +69,6 @@ type Config struct {
 	// shutting down the Processor. 0 for no timeout.
 	EventChanTimeout time.Duration
 
-	// CheckStreamsInterval specifies interval at which a Processor will check
-	// all streams to make sure they have not been canceled.
-	CheckStreamsInterval time.Duration
-
 	// Metrics is for production monitoring of RangeFeeds.
 	Metrics *Metrics
 
@@ -101,9 +94,39 @@ func (sc *Config) SetDefaults() {
 			sc.PushTxnsAge = defaultPushTxnsAge
 		}
 	}
-	if sc.CheckStreamsInterval == 0 {
-		sc.CheckStreamsInterval = defaultCheckStreamsInterval
-	}
+}
+
+type Server interface {
+	// Lifecycle of server.
+
+	// Start processor with intent scanner.
+	// Intent scanner factory should move to config for consistency.
+	Start(stopper *stop.Stopper, rtsIterFunc IntentScannerConstructor) error
+	Stop()
+	StopWithErr(pErr *kvpb.Error)
+
+	// Lifecycle of registrations.
+
+	Register(
+		span roachpb.RSpan,
+		startTS hlc.Timestamp,
+		catchUpIterConstructor CatchUpIteratorConstructor,
+		withDiff bool,
+		stream Stream,
+		disconnectFn func(),
+		done *future.ErrorFuture,
+	) (bool, *Filter)
+	DisconnectSpanWithErr(span roachpb.Span, pErr *kvpb.Error)
+	Filter() *Filter
+	Len() int
+
+	// Data flow.
+
+	ConsumeLogicalOps(ctx context.Context, ops ...enginepb.MVCCLogicalOp) bool
+	ConsumeSSTable(
+		ctx context.Context, sst []byte, sstSpan roachpb.Span, writeTS hlc.Timestamp,
+	) bool
+	ForwardClosedTS(ctx context.Context, closedTS hlc.Timestamp) bool
 }
 
 // Processor manages a set of rangefeed registrations and handles the routing of
@@ -192,7 +215,7 @@ type spanErr struct {
 
 // NewProcessor creates a new rangefeed Processor. The corresponding goroutine
 // should be launched using the Start method.
-func NewProcessor(cfg Config) *Processor {
+func NewProcessor(cfg Config) Server {
 	cfg.SetDefaults()
 	cfg.AmbientContext.AddLogTag("rangefeed", nil)
 	p := &Processor{
