@@ -18,7 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	kvpb "github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -68,6 +68,7 @@ func (e *Env) CheckConsistency(ctx context.Context, span roachpb.Span) []error {
 		if err := rows.Scan(&rangeID, &key, &status, &detail); err != nil {
 			return []error{err}
 		}
+		e.L.Logf("verifying range r%d, start key %s", rangeID, key)
 		switch status {
 		case kvpb.CheckConsistencyResponse_RANGE_INDETERMINATE.String():
 			// Can't do anything, so let it slide.

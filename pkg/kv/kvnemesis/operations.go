@@ -312,7 +312,7 @@ func (op AddSSTableOperation) format(w *strings.Builder, fctx formatCtx) {
 }
 
 func (op SplitOperation) format(w *strings.Builder, fctx formatCtx) {
-	fmt.Fprintf(w, `%s.AdminSplit(ctx, %s)`, fctx.receiver, fmtKey(op.Key))
+	fmt.Fprintf(w, `%s.AdminSplit(ctx, %s, hlc.MaxTimestamp)`, fctx.receiver, fmtKey(op.Key))
 	op.Result.format(w)
 }
 
@@ -329,12 +329,13 @@ func (op BatchOperation) format(w *strings.Builder, fctx formatCtx) {
 }
 
 func (op ChangeReplicasOperation) format(w *strings.Builder, fctx formatCtx) {
-	fmt.Fprintf(w, `%s.AdminChangeReplicas(ctx, %s, %s)`, fctx.receiver, fmtKey(op.Key), op.Changes)
+	fmt.Fprintf(w, `%s.AdminChangeReplicas(ctx, %s, getRangeDesc(ctx, %s, %s), %s)`, fctx.receiver,
+		fmtKey(op.Key), fmtKey(op.Key), fctx.receiver, op.Changes)
 	op.Result.format(w)
 }
 
 func (op TransferLeaseOperation) format(w *strings.Builder, fctx formatCtx) {
-	fmt.Fprintf(w, `%s.TransferLeaseOperation(ctx, %s, %d)`, fctx.receiver, fmtKey(op.Key), op.Target)
+	fmt.Fprintf(w, `%s.AdminTransferLease(ctx, %s, %d)`, fctx.receiver, fmtKey(op.Key), op.Target)
 	op.Result.format(w)
 }
 

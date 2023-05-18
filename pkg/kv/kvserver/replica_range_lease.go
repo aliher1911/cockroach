@@ -344,6 +344,7 @@ func (p *pendingLeaseRequest) requestLeaseAsync(
 	status kvserverpb.LeaseStatus,
 	leaseReq kvpb.Request,
 ) error {
+	log.Infof(parentCtx, "req lease")
 	// Create a new context. We run the request to completion even if all callers
 	// go away, to ensure leases can be acquired e.g. in the face of IO delays
 	// which may trigger client timeouts).

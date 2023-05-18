@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -134,6 +135,10 @@ func evalNewLease(
 	if err := MakeStateLoader(rec).SetLease(ctx, readWriter, ms, lease); err != nil {
 		return newFailedLeaseTrigger(isTransfer), err
 	}
+
+	v := roachpb.Value{}
+	v.SetProto(&lease)
+	log.Infof(ctx, "ms sys bytes delta = %d, newValLen = %d, lease = %s", ms.SysBytes, v.Size(), lease.String())
 
 	var pd result.Result
 	pd.Replicated.State = &kvserverpb.ReplicaState{

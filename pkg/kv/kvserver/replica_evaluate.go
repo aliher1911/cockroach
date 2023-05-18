@@ -527,6 +527,7 @@ func evaluateCommand(
 		} else {
 			pd, err = cmd.EvalRO(ctx, readWriter, cArgs, reply)
 		}
+		// log.Infof(ctx, "stats delta after command(%s/%t): %s", args.Method(), err==nil, ms)
 	} else {
 		return result.Result{}, errors.Errorf("unrecognized command %s", args.Method())
 	}

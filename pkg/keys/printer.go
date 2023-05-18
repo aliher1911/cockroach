@@ -120,6 +120,7 @@ var (
 		{name: "RangeStats", suffix: LocalRangeStatsLegacySuffix},
 		{name: "RangeGCThreshold", suffix: LocalRangeGCThresholdSuffix},
 		{name: "RangeVersion", suffix: LocalRangeVersionSuffix},
+		{name: "RangeGCHint}", suffix: LocalRangeGCHintSuffix},
 	}
 
 	rangeSuffixDict = []struct {

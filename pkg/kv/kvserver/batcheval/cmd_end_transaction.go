@@ -102,6 +102,7 @@ func declareKeysEndTxn(
 
 		if et.InternalCommitTrigger != nil {
 			if st := et.InternalCommitTrigger.SplitTrigger; st != nil {
+				log.Infof(context.Background(), "declare split latches for r%d", rs.GetRangeID())
 				// Splits may read from the entire pre-split range (they read
 				// from the LHS in all cases, and the RHS only when the existing
 				// stats contain estimates). Splits declare non-MVCC read access
@@ -1013,7 +1014,7 @@ func splitTrigger(
 	}
 
 	h := splitStatsHelperInput{
-		AbsPreSplitBothEstimated: rec.GetMVCCStats(),
+		AbsPreSplitBothEstimated: makeGetMVCCStats(ctx, batch, rec),
 		DeltaBatchEstimated:      bothDeltaMS,
 		DeltaRangeKey:            rangeKeyDeltaMS,
 		AbsPostSplitLeftFn:       makeScanStatsFn(ctx, batch, ts, &split.LeftDesc, "left hand side"),
@@ -1030,6 +1031,20 @@ func splitTrigger(
 // LHS ranges. However, to improve test coverage, we use a metamorphic value.
 var splitScansRightForStatsFirst = util.ConstantWithMetamorphicTestBool(
 	"split-scans-right-for-stats-first", false)
+
+func makeGetMVCCStats(
+	ctx context.Context, reader storage.Reader, rec EvalContext,
+) splitStatsScanFn {
+	// Test with eager fetch.
+	var stats = rec.GetMVCCStats()
+	var read = true
+	return func() (enginepb.MVCCStats, error) {
+		if !read {
+			stats = rec.GetMVCCStats()
+		}
+		return stats, nil
+	}
+}
 
 // makeScanStatsFn constructs a splitStatsScanFn for the provided post-split
 // range descriptor which computes the range's statistics.
@@ -1193,6 +1208,7 @@ func splitTriggerHelper(
 		if err != nil {
 			return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err, "unable to write initial Replica state")
 		}
+		log.Infof(ctx, "lhs lease %s, rhs lease %s", leftLease.String(), rightLease.String())
 	}
 
 	var pd result.Result
@@ -1203,7 +1219,9 @@ func splitTriggerHelper(
 		RHSDelta: *h.AbsPostSplitRight(),
 	}
 
-	deltaPostSplitLeft := h.DeltaPostSplitLeft()
+	deltaPostSplitLeft, err := h.DeltaPostSplitLeft()
+	log.Infof(ctx, "stat delta split left %s", deltaPostSplitLeft.String())
+	log.Infof(ctx, "stat delta split right %s", pd.Replicated.Split.RHSDelta)
 	return deltaPostSplitLeft, pd, nil
 }
 

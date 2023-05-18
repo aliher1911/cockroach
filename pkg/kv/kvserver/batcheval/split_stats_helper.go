@@ -119,7 +119,7 @@ type splitStatsScanFn func() (enginepb.MVCCStats, error)
 
 // splitStatsHelperInput is passed to makeSplitStatsHelper.
 type splitStatsHelperInput struct {
-	AbsPreSplitBothEstimated enginepb.MVCCStats
+	AbsPreSplitBothEstimated splitStatsScanFn
 	DeltaBatchEstimated      enginepb.MVCCStats
 	DeltaRangeKey            enginepb.MVCCStats
 	// AbsPostSplitLeftFn returns the stats for the left hand side of the
@@ -159,11 +159,14 @@ func makeSplitStatsHelper(input splitStatsHelperInput) (splitStatsHelper, error)
 		return splitStatsHelper{}, err
 	}
 
-	if h.in.AbsPreSplitBothEstimated.ContainsEstimates == 0 &&
+	ms, err := h.in.AbsPreSplitBothEstimated()
+	if err != nil {
+		return splitStatsHelper{}, err
+	}
+	if ms.ContainsEstimates == 0 &&
 		h.in.DeltaBatchEstimated.ContainsEstimates == 0 {
 		// We have CombinedErrorDelta zero, so use arithmetic to compute the
 		// stats for the second side.
-		ms := h.in.AbsPreSplitBothEstimated
 		ms.Subtract(absPostSplitFirst)
 		ms.Add(h.in.DeltaBatchEstimated)
 		ms.Add(h.in.DeltaRangeKey)
@@ -209,12 +212,16 @@ func (h splitStatsHelper) AbsPostSplitRight() *enginepb.MVCCStats {
 // as the result of the split. It accounts for the data moved to the right hand
 // side as well as any mutations to the left hand side carried out during the
 // split, and additionally removes any estimates present in the pre-split stats.
-func (h splitStatsHelper) DeltaPostSplitLeft() enginepb.MVCCStats {
+func (h splitStatsHelper) DeltaPostSplitLeft() (enginepb.MVCCStats, error) {
 	// NB: if we ever wanted to also write to the left hand side after init'ing
 	// the helper, we can make that work, too.
 	// NB: note how none of this depends on mutations to absPostSplitRight.
 	ms := *h.absPostSplitLeft
-	ms.Subtract(h.in.AbsPreSplitBothEstimated)
+	full, err := h.in.AbsPreSplitBothEstimated()
+	if err != nil {
+		return enginepb.MVCCStats{}, err
+	}
+	ms.Subtract(full)
 
-	return ms
+	return ms, nil
 }

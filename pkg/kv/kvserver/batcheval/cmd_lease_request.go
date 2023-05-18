@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func init() {
@@ -34,6 +35,7 @@ func declareKeysRequestLease(
 	latchSpans, _ *spanset.SpanSet,
 	_ time.Duration,
 ) {
+	log.Infof(context.Background(), "declare request lease for r%d", rs.GetRangeID())
 	// NOTE: RequestLease is run on replicas that do not hold the lease, so
 	// acquiring latches would not help synchronize with other requests. As
 	// such, the request does not actually acquire latches over these spans

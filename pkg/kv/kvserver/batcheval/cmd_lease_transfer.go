@@ -28,12 +28,13 @@ func init() {
 }
 
 func declareKeysTransferLease(
-	_ ImmutableRangeState,
+	rs ImmutableRangeState,
 	_ *kvpb.Header,
 	_ kvpb.Request,
 	latchSpans, _ *spanset.SpanSet,
 	_ time.Duration,
 ) {
+	log.Infof(context.Background(), "declare latches for r%d", rs.GetRangeID())
 	// TransferLease must not run concurrently with any other request so it uses
 	// latches to synchronize with all other reads and writes on the outgoing
 	// leaseholder. Additionally, it observes the state of the timestamp cache
