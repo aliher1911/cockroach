@@ -1,0 +1,40 @@
+# Test verifies that rangefeed delivers data written prior to feed creation
+# and ensures that catch up timestamp is respected and treated as exclusive
+# value.
+put-keys
+  key=a, val=1
+  key=b, val=2, ts=beforeFirst
+  key=c, val=3
+  key=a, val=4
+----
+ok
+
+create-feed startKey=a endKey=z startTs=beforeFirst
+----
+ok
+
+# Ensure that we are getting further updates as realtime feed, not as catchup scan.
+wait-feed
+----
+ok
+
+put-keys
+  key=a, val=5
+  key=b, val=6
+  key=c, val=7
+----
+ok
+
+wait-feed
+----
+ok
+
+# Note that dump is sorted by key and then by timestamp for readability.
+# We expect data written prior to range feed start, excluding row at startTS.
+dump-feed
+----
+key=a, val=4
+key=a, val=5
+key=b, val=6
+key=c, val=3
+key=c, val=7
